@@ -61,6 +61,7 @@ public:
 private:
     static constexpr std::size_t small_bin_quantum = 64;
     static constexpr std::size_t small_bin_count = 128;
+    static constexpr std::size_t small_bin_words = small_bin_count / 64;
     static constexpr std::size_t small_block_limit =
         small_bin_quantum * small_bin_count;
     static constexpr std::size_t large_bin_count =

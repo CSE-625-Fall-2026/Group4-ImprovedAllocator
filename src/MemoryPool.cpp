@@ -63,7 +63,36 @@ struct ThreadCache {
     std::array<std::size_t, MemoryPool::small_bin_count> counts{};
     std::array<std::size_t, MemoryPool::small_bin_count> targets{};
     std::array<std::size_t, MemoryPool::small_bin_count> refill_events{};
+    //One bit per bin, set while that bin holds at least one blockk
+    std::array<std::uint64_t, MemoryPool::small_bin_words> occupied{};
     std::size_t cached_bytes{0};
+    //new functions test_1
+    void markOccupied(std::size_t bin) noexcept {
+        occupied[bin / 64] |= std::uint64_t{1} << (bin % 64);
+    }
+
+    void clearIfEmpty(std::size_t bin) noexcept {
+        if (bins[bin] == nullptr) {
+            occupied[bin / 64] &= ~(std::uint64_t{1} << (bin % 64));
+        }
+    }
+
+    // First bin at or after `from` whose bit is set, or small_bin_count.
+    std::size_t nextOccupied(std::size_t from) const noexcept {
+        for (std::size_t word = from / 64;
+             word < MemoryPool::small_bin_words;
+             ++word) {
+            std::uint64_t bits = occupied[word];
+            if (word == from / 64) {
+                bits &= ~std::uint64_t{0} << (from % 64);
+            }
+            if (bits != 0) {
+                return word * 64 +
+                    static_cast<std::size_t>(__builtin_ctzll(bits));
+            }
+        }
+        return MemoryPool::small_bin_count;
+    }
 
     ~ThreadCache();
 };
@@ -343,6 +372,7 @@ detail::ThreadCache* MemoryPool::registerThreadCache() noexcept {
     cache.counts.fill(0);
     cache.targets.fill(initial_cached_blocks_per_bin);
     cache.refill_events.fill(0);
+    cache.occupied.fill(0);
     cache.cached_bytes = 0;
     cache.owner = this;
     ++active_thread_caches_;
@@ -361,9 +391,9 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
         return nullptr;
     }
 
-    for (std::size_t bin = smallBinIndex(minimum_size);
+    for (std::size_t bin = cache.nextOccupied(smallBinIndex(minimum_size));
          bin < small_bin_count;
-         ++bin) {
+         bin = cache.nextOccupied(bin + 1))  {
         detail::BlockHeader* best = nullptr;
         for (detail::BlockHeader* block = cache.bins[bin]; block != nullptr;
              block = block->next_free) {
@@ -388,6 +418,9 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
         best->next_free = nullptr;
         --cache.counts[bin];
         cache.cached_bytes -= best->total_size;
+
+        cache.clearIfEmpty(bin);
+
         return best;
     }
     return nullptr;
@@ -630,6 +663,7 @@ void MemoryPool::pushCachedBlock(
         block->next_free->previous_free = block;
     }
     cache.bins[bin] = block;
+    cache.markOccupied(bin);
     ++cache.counts[bin];
     cache.cached_bytes += block->total_size;
 }
@@ -772,6 +806,7 @@ void MemoryPool::flushCacheBinUnlocked(
         block->magic = free_block_magic;
         insertFreeBlock(block);
     }
+    cache.clearIfEmpty(bin);
 }
 
 void MemoryPool::flushThreadCacheUnlocked(
