@@ -102,6 +102,77 @@ int main() {
     }
     assert(pool.statistics().live_allocations == 0);
 
+    // Sparse thread cache: on a fresh thread (empty cache) free blocks in a
+    // few widely spaced size classes, then request sizes whose OWN class is
+    // empty.. every probe must be a valid, distinct pool block. With profiling
+    // on, every probe must also be a cache hit that skipped at least one
+    // empty bin (occupancy bitmap reason)
+    {
+        bool sparse_ok = true;
+        std::thread([&pool, &sparse_ok] {
+            const std::size_t sparse_sizes[] = {200, 1400, 3000, 5200, 7600};
+            void* parked[std::size(sparse_sizes)];
+            for (std::size_t index = 0; index < std::size(sparse_sizes); ++index) {
+                parked[index] = pool.allocate(sparse_sizes[index]);
+            }
+            for (void* pointer : parked) {
+                pool.deallocate(pointer);
+            }
+            const custom_memory::ProfileCounters before = pool.profileCounters();
+            const std::size_t probe_sizes[] = {100, 1300, 2900, 5100, 7500};
+            void* reused[std::size(probe_sizes)];
+            for (std::size_t index = 0; index < std::size(probe_sizes); ++index) {
+                reused[index] = pool.allocate(probe_sizes[index]);
+                sparse_ok = sparse_ok && pool.owns(reused[index]);
+                for (std::size_t other = 0; other < index; ++other) {
+                    sparse_ok = sparse_ok && reused[other] != reused[index];
+                }
+            }
+            const custom_memory::ProfileCounters after = pool.profileCounters();
+            #if CUSTOM_MEMORY_PROFILE
+                        sparse_ok = sparse_ok &&
+                            after.cache_hits == before.cache_hits + std::size(probe_sizes);
+                        sparse_ok = sparse_ok && after.cache_misses == before.cache_misses;
+                        sparse_ok = sparse_ok &&
+                            after.bins_skipped >= before.bins_skipped + std::size(probe_sizes);
+            #else
+                        (void)before;
+                        (void)after;
+            #endif
+            for (void* pointer : reused) {
+                pool.deallocate(pointer);
+            }
+        }).join();
+        assert(sparse_ok);
+    }
+
+    // Random churn across every small size class keeps the bitmap and the
+    // bin lists in step; any drift would surface as a bad pointer below.
+    {
+        void* churn[256] = {};
+        std::size_t seed = 6252026;
+        for (std::size_t iteration = 0; iteration < 20000; ++iteration) {
+            seed = seed * 1103515245u + 12345u;
+            const std::size_t slot = (seed >> 8) % std::size(churn);
+            if (churn[slot] != nullptr) {
+                pool.deallocate(churn[slot]);
+                churn[slot] = nullptr;
+            } else {
+                const std::size_t bytes = 1 + ((seed >> 16) % 8000);
+                churn[slot] = pool.allocate(bytes);
+                assert(pool.owns(churn[slot]));
+            }
+        }
+        for (void*& pointer : churn) {
+            if (pointer != nullptr) {
+                pool.deallocate(pointer);
+                pointer = nullptr;
+            }
+        }
+    }
+    assert(pool.statistics().live_allocations == 0);
+    assert(!error_reported);
+
     auto* bytes = static_cast<std::byte*>(pool.allocate(8));
     bytes[8] = std::byte{0};
     pool.deallocate(bytes);
