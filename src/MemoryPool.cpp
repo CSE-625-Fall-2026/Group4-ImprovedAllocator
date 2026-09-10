@@ -8,6 +8,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#if CUSTOM_MEMORY_PROFILE
+#define CMA_PROFILE_ADD(counter, amount) \
+    (counter).fetch_add((amount), std::memory_order_relaxed)
+#else
+#define CMA_PROFILE_ADD(counter, amount) ((void)0)
+#endif
+
 namespace custom_memory {
 namespace {
 
@@ -325,6 +332,28 @@ Statistics MemoryPool::statistics() const noexcept {
     };
 }
 
+ProfileCounters MemoryPool::profileCounters() const noexcept {
+    ProfileCounters counters;
+    counters.cache_hits = profile_cache_hits_.load(std::memory_order_relaxed);
+    counters.cache_misses = profile_cache_misses_.load(std::memory_order_relaxed);
+    counters.bins_visited = profile_bins_visited_.load(std::memory_order_relaxed);
+    counters.bins_skipped = profile_bins_skipped_.load(std::memory_order_relaxed);
+    counters.cache_refills = profile_cache_refills_.load(std::memory_order_relaxed);
+    counters.cache_flushes = profile_cache_flushes_.load(std::memory_order_relaxed);
+    counters.coalesce_events = profile_coalesce_events_.load(std::memory_order_relaxed);
+    return counters;
+}
+
+void MemoryPool::resetProfileCounters() noexcept {
+    profile_cache_hits_.store(0, std::memory_order_relaxed);
+    profile_cache_misses_.store(0, std::memory_order_relaxed);
+    profile_bins_visited_.store(0, std::memory_order_relaxed);
+    profile_bins_skipped_.store(0, std::memory_order_relaxed);
+    profile_cache_refills_.store(0, std::memory_order_relaxed);
+    profile_cache_flushes_.store(0, std::memory_order_relaxed);
+    profile_coalesce_events_.store(0, std::memory_order_relaxed);
+}
+
 std::size_t MemoryPool::smallBinIndex(std::size_t block_size) noexcept {
     if (block_size == 0) {
         return 0;
@@ -391,9 +420,15 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
         return nullptr;
     }
 
-    for (std::size_t bin = cache.nextOccupied(smallBinIndex(minimum_size));
+    const std::size_t start = smallBinIndex(minimum_size); 
+    std::size_t previous = start;
+    for (std::size_t bin = cache.nextOccupied(start);
          bin < small_bin_count;
-         bin = cache.nextOccupied(bin + 1))  {
+         bin = cache.nextOccupied(bin + 1)) {
+            
+        CMA_PROFILE_ADD(profile_bins_visited_, 1);
+        CMA_PROFILE_ADD(profile_bins_skipped_, bin - previous);
+        previous = bin + 1;
         detail::BlockHeader* best = nullptr;
         for (detail::BlockHeader* block = cache.bins[bin]; block != nullptr;
              block = block->next_free) {
@@ -420,9 +455,10 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
         cache.cached_bytes -= best->total_size;
 
         cache.clearIfEmpty(bin);
-
+        CMA_PROFILE_ADD(profile_cache_hits_, 1);
         return best;
     }
+    CMA_PROFILE_ADD(profile_cache_misses_, 1);
     return nullptr;
 }
 
@@ -611,6 +647,7 @@ detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
     }
 
     const std::size_t bin = smallBinIndex(first->total_size);
+    CMA_PROFILE_ADD(profile_cache_refills_, 1);
     ++cache.refill_events[bin];
     if (cache.refill_events[bin] >= cache_growth_interval) {
         cache.targets[bin] = std::min(
@@ -805,6 +842,7 @@ void MemoryPool::flushCacheBinUnlocked(
 
         block->magic = free_block_magic;
         insertFreeBlock(block);
+        CMA_PROFILE_ADD(profile_cache_flushes_, 1);
     }
     cache.clearIfEmpty(bin);
 }
@@ -904,6 +942,8 @@ void MemoryPool::removeFreeBlock(detail::BlockHeader* block) noexcept {
 }
 
 void MemoryPool::coalesceFreeBlocksUnlocked() noexcept {
+
+    CMA_PROFILE_ADD(profile_coalesce_events_, 1);
     if (region_ == nullptr) {
         return;
     }

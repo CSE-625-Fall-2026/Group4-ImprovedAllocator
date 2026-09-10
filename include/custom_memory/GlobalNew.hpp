@@ -12,6 +12,7 @@ bool shutdown() noexcept;
 
 [[nodiscard]] bool owns(const void* pointer) noexcept;
 [[nodiscard]] Statistics statistics() noexcept;
+[[nodiscard]] ProfileCounters profileCounters() noexcept;
 
 }
 

@@ -31,6 +31,18 @@ struct Statistics {
     std::size_t total_deallocations{0};
 };
 
+// new struct allocator behaviour counters. Counting is compiled in only when the library is built with CUSTOM_MEMORY_PROFILE=ON
+// or else every field stays zero and the hot paths contain no counting code.
+struct ProfileCounters {
+    std::uint64_t cache_hits{0};
+    std::uint64_t cache_misses{0};
+    std::uint64_t bins_visited{0};
+    std::uint64_t bins_skipped{0};
+    std::uint64_t cache_refills{0};
+    std::uint64_t cache_flushes{0};
+    std::uint64_t coalesce_events{0};
+};
+
 namespace detail {
 struct BlockHeader;
 struct ThreadCache;
@@ -49,7 +61,8 @@ public:
     [[nodiscard]] bool isInitialized() const noexcept;
     [[nodiscard]] bool owns(const void* pointer) const noexcept;
     [[nodiscard]] Statistics statistics() const noexcept;
-
+    [[nodiscard]] ProfileCounters profileCounters() const noexcept;
+    void resetProfileCounters() noexcept;
     void* allocate(
         std::size_t bytes,
         std::size_t alignment = alignof(std::max_align_t)
@@ -159,6 +172,14 @@ private:
     std::atomic<std::size_t> total_allocations_{0};
     std::atomic<std::size_t> total_deallocations_{0};
     std::atomic<ErrorHandler> error_handler_{defaultErrorHandler};
+    // new private members
+    std::atomic<std::uint64_t> profile_cache_hits_{0};
+    std::atomic<std::uint64_t> profile_cache_misses_{0};
+    std::atomic<std::uint64_t> profile_bins_visited_{0};
+    std::atomic<std::uint64_t> profile_bins_skipped_{0};
+    std::atomic<std::uint64_t> profile_cache_refills_{0};
+    std::atomic<std::uint64_t> profile_cache_flushes_{0};
+    std::atomic<std::uint64_t> profile_coalesce_events_{0};
 };
 
 }

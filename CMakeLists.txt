@@ -2,12 +2,18 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     CustomMemoryAllocator
-    VERSION 7.0.0
+    VERSION 8.0.0
     LANGUAGES CXX
 )
 
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
+
+option(
+    CUSTOM_MEMORY_PROFILE
+    "Count allocator behaviour(cache hits,bins scanned,refills). Leave OFF for timing runs."
+    OFF
+)
 
 if(PROJECT_IS_TOP_LEVEL)
     include(CTest)
@@ -29,6 +35,12 @@ set_target_properties(
 
 target_compile_features(custom_memory_allocator PUBLIC cxx_std_17)
 target_link_libraries(custom_memory_allocator PUBLIC Threads::Threads)
+if(CUSTOM_MEMORY_PROFILE)
+    target_compile_definitions(
+        custom_memory_allocator
+        PUBLIC CUSTOM_MEMORY_PROFILE=1
+    )
+endif()
 target_include_directories(
     custom_memory_allocator
     PUBLIC

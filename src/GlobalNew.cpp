@@ -1,6 +1,7 @@
 #include "custom_memory/GlobalNew.hpp"
 
 #include <cstdlib>
+#include <cstdio>
 #include <new>
 
 namespace {
@@ -54,6 +55,22 @@ bool initialize(std::size_t bytes) noexcept {
 }
 
 bool shutdown() noexcept {
+#if CUSTOM_MEMORY_PROFILE
+    const ProfileCounters counters = MemoryPool::instance().profileCounters();
+    std::fprintf(
+        stderr,
+        "custom_memory profile: cache_hits=%llu cache_misses=%llu "
+        "bins_visited=%llu bins_skipped=%llu cache_refills=%llu "
+        "cache_flushes=%llu coalesce_events=%llu\n",
+        static_cast<unsigned long long>(counters.cache_hits),
+        static_cast<unsigned long long>(counters.cache_misses),
+        static_cast<unsigned long long>(counters.bins_visited),
+        static_cast<unsigned long long>(counters.bins_skipped),
+        static_cast<unsigned long long>(counters.cache_refills),
+        static_cast<unsigned long long>(counters.cache_flushes),
+        static_cast<unsigned long long>(counters.coalesce_events)
+    );
+#endif
     return MemoryPool::instance().shutdown();
 }
 
@@ -63,6 +80,10 @@ bool owns(const void* pointer) noexcept {
 
 Statistics statistics() noexcept {
     return MemoryPool::instance().statistics();
+}
+
+ProfileCounters profileCounters() noexcept {
+    return MemoryPool::instance().profileCounters();
 }
 
 }
