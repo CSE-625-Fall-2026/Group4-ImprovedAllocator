@@ -72,6 +72,13 @@ struct ThreadCache {
     std::array<std::size_t, MemoryPool::small_bin_count> refill_events{};
     //One bit per bin, set while that bin holds at least one blockk
     std::array<std::uint64_t, MemoryPool::small_bin_words> occupied{};
+    // Statistics are accumulated here and pushed to the pool's atomic
+    // counters in batches, so the hot paths avoid locked instructions.
+    std::int64_t pending_bytes{0};
+    std::int64_t pending_live{0};
+    std::uint64_t pending_allocations{0};
+    std::uint64_t pending_deallocations{0};
+    std::size_t pending_operations{0};
     std::size_t cached_bytes{0};
     //new functions test_1
     void markOccupied(std::size_t bin) noexcept {
@@ -261,6 +268,7 @@ bool MemoryPool::shutdown() noexcept {
 
     auto& cache = detail::current_thread_cache;
     if (cache.owner == this) {
+        flushStatistics(cache);
         flushThreadCacheUnlocked(cache);
         cache.owner = nullptr;
         --active_thread_caches_;
@@ -323,6 +331,11 @@ bool MemoryPool::ownsUnlocked(const void* pointer) const noexcept {
 }
 
 Statistics MemoryPool::statistics() const noexcept {
+    // Fold in this thread's pending counts so the caller sees its own work.
+    auto& cache = detail::current_thread_cache;
+    if (cache.owner == this) {
+        const_cast<MemoryPool*>(this)->flushStatistics(cache);
+    }
     return {
         capacity_bytes_.load(std::memory_order_relaxed),
         allocated_bytes_.load(std::memory_order_relaxed),
@@ -408,6 +421,47 @@ detail::ThreadCache* MemoryPool::registerThreadCache() noexcept {
     return &cache;
 }
 
+void MemoryPool::flushStatistics(detail::ThreadCache& cache) noexcept {
+    if (cache.pending_operations == 0) {
+        return;
+    }
+    if (cache.pending_bytes >= 0) {
+        allocated_bytes_.fetch_add(
+            static_cast<std::size_t>(cache.pending_bytes),
+            std::memory_order_relaxed
+        );
+    } else {
+        allocated_bytes_.fetch_sub(
+            static_cast<std::size_t>(-cache.pending_bytes),
+            std::memory_order_relaxed
+        );
+    }
+    if (cache.pending_live >= 0) {
+        live_allocations_.fetch_add(
+            static_cast<std::size_t>(cache.pending_live),
+            std::memory_order_relaxed
+        );
+    } else {
+        live_allocations_.fetch_sub(
+            static_cast<std::size_t>(-cache.pending_live),
+            std::memory_order_release
+        );
+    }
+    total_allocations_.fetch_add(
+        cache.pending_allocations,
+        std::memory_order_relaxed
+    );
+    total_deallocations_.fetch_add(
+        cache.pending_deallocations,
+        std::memory_order_relaxed
+    );
+    cache.pending_bytes = 0;
+    cache.pending_live = 0;
+    cache.pending_allocations = 0;
+    cache.pending_deallocations = 0;
+    cache.pending_operations = 0;
+}
+
 detail::BlockHeader* MemoryPool::takeCachedBlock(
     detail::ThreadCache& cache,
     std::size_t bytes,
@@ -425,7 +479,7 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
     for (std::size_t bin = cache.nextOccupied(start);
          bin < small_bin_count;
          bin = cache.nextOccupied(bin + 1)) {
-            
+
         CMA_PROFILE_ADD(profile_bins_visited_, 1);
         CMA_PROFILE_ADD(profile_bins_skipped_, bin - previous);
         previous = bin + 1;
@@ -538,9 +592,13 @@ void* MemoryPool::activateBlock(
     storeCanary(front_address, front_canary);
     storeCanary(layout.user + bytes, rear_canary);
 
-    allocated_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    live_allocations_.fetch_add(1, std::memory_order_relaxed);
-    total_allocations_.fetch_add(1, std::memory_order_relaxed);
+    auto& cache = detail::current_thread_cache;
+    cache.pending_bytes += static_cast<std::int64_t>(bytes);
+    ++cache.pending_live;
+    ++cache.pending_allocations;
+    if (++cache.pending_operations >= statistics_flush_interval) {
+        flushStatistics(cache);
+    }
     return layout.user;
 }
 
@@ -803,12 +861,22 @@ void MemoryPool::deallocate(void* pointer) noexcept {
         cache = registerThreadCache();
     }
 
-    allocated_bytes_.fetch_sub(
-        block->requested_size,
-        std::memory_order_relaxed
-    );
-    live_allocations_.fetch_sub(1, std::memory_order_release);
-    total_deallocations_.fetch_add(1, std::memory_order_relaxed);
+    if (cache != nullptr) {
+        cache->pending_bytes -= static_cast<std::int64_t>(block->requested_size);
+        --cache->pending_live;
+        ++cache->pending_deallocations;
+        if (++cache->pending_operations >= statistics_flush_interval) {
+            flushStatistics(*cache);
+        }
+    } else {
+        // Large blocks bypass the cache and are rare; keep exact accounting.
+        allocated_bytes_.fetch_sub(
+            block->requested_size,
+            std::memory_order_relaxed
+        );
+        live_allocations_.fetch_sub(1, std::memory_order_release);
+        total_deallocations_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     block->requested_size = 0;
     block->user_pointer = nullptr;
@@ -860,6 +928,7 @@ void MemoryPool::releaseThreadCache(detail::ThreadCache& cache) noexcept {
     if (cache.owner != this) {
         return;
     }
+    flushStatistics(cache);
     flushThreadCacheUnlocked(cache);
     cache.owner = nullptr;
     --active_thread_caches_;
